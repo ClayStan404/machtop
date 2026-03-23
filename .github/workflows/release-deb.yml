@@ -1,0 +1,198 @@
+name: Release Debian Package
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to publish, for example v0.1.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  resolve-release:
+    runs-on: ubuntu-24.04
+    outputs:
+      release_tag: ${{ steps.vars.outputs.release_tag }}
+
+    steps:
+      - name: Resolve release tag
+        id: vars
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            release_tag="${{ inputs.release_tag }}"
+          else
+            release_tag="${GITHUB_REF_NAME}"
+          fi
+          echo "release_tag=${release_tag}" >> "${GITHUB_OUTPUT}"
+
+  build-deb:
+    needs: resolve-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runs-on: ubuntu-24.04
+          - arch: arm64
+            runs-on: ubuntu-24.04-arm
+
+    runs-on: ${{ matrix.runs-on }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install packaging dependencies
+        run: sudo apt-get update && sudo apt-get install -y dpkg-dev
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Build Debian package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo deb --locked
+          deb_path="$(find target/debian -maxdepth 1 -type f -name '*.deb' | head -n 1)"
+          if [[ -z "${deb_path}" ]]; then
+            echo "No .deb package was produced" >&2
+            exit 1
+          fi
+          sha_path="${deb_path}.sha256"
+          sha256sum "${deb_path}" > "${sha_path}"
+          echo "deb_path=${deb_path}" >> "${GITHUB_OUTPUT}"
+          echo "sha_path=${sha_path}" >> "${GITHUB_OUTPUT}"
+
+      - name: Smoke test Debian package install
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo dpkg -i "${{ steps.package.outputs.deb_path }}"
+          dpkg -L machtop | grep -Fx '/usr/bin/machtop'
+          set +e
+          TERM=xterm timeout 2s script -qec "/usr/bin/machtop" /dev/null >/tmp/machtop-smoke.log 2>&1
+          status=$?
+          set -e
+          if [[ "${status}" -ne 0 && "${status}" -ne 124 ]]; then
+            cat /tmp/machtop-smoke.log >&2
+            exit "${status}"
+          fi
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-package-${{ matrix.arch }}
+          path: |
+            ${{ steps.package.outputs.deb_path }}
+            ${{ steps.package.outputs.sha_path }}
+
+  build-deb-arm64-bookworm:
+    needs: resolve-release
+    runs-on: ubuntu-24.04-arm
+    container:
+      image: rust:bookworm
+
+    steps:
+      - name: Install container dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y git dpkg-dev pkg-config
+
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Build Debian 12 compatible package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo deb --locked
+          deb_path="$(find target/debian -maxdepth 1 -type f -name '*.deb' | head -n 1)"
+          if [[ -z "${deb_path}" ]]; then
+            echo "No .deb package was produced" >&2
+            exit 1
+          fi
+          compat_deb_path="${deb_path%.deb}_bookworm.deb"
+          mv "${deb_path}" "${compat_deb_path}"
+          sha_path="${compat_deb_path}.sha256"
+          sha256sum "${compat_deb_path}" > "${sha_path}"
+          echo "deb_path=${compat_deb_path}" >> "${GITHUB_OUTPUT}"
+          echo "sha_path=${sha_path}" >> "${GITHUB_OUTPUT}"
+
+      - name: Smoke test Debian package install
+        shell: bash
+        run: |
+          set -euo pipefail
+          dpkg -i "${{ steps.package.outputs.deb_path }}"
+          dpkg -L machtop | grep -Fx '/usr/bin/machtop'
+          set +e
+          TERM=xterm timeout 2s script -qec "/usr/bin/machtop" /dev/null >/tmp/machtop-smoke.log 2>&1
+          status=$?
+          set -e
+          if [[ "${status}" -ne 0 && "${status}" -ne 124 ]]; then
+            cat /tmp/machtop-smoke.log >&2
+            exit "${status}"
+          fi
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-package-arm64-bookworm
+          path: |
+            ${{ steps.package.outputs.deb_path }}
+            ${{ steps.package.outputs.sha_path }}
+
+  publish-release:
+    needs:
+      - resolve-release
+      - build-deb
+      - build-deb-arm64-bookworm
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          pattern: deb-package-*
+          merge-multiple: true
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.resolve-release.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          files: |
+            release-artifacts/*.deb
+            release-artifacts/*.sha256
+          generate_release_notes: true
+          fail_on_unmatched_files: true
