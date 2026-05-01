@@ -25,12 +25,31 @@ pub struct SensorSummary {
 pub struct AcceleratorMetrics {
     pub gpu: Option<GpuMetrics>,
     pub npu: Option<NpuMetrics>,
+    pub vpu: Option<VpuMetrics>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeState {
+    Active,
+    Suspended,
+    Unknown,
+}
+
+impl RuntimeState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Suspended => "suspended",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct GpuMetrics {
     pub usage_percent: Option<f64>,
     pub frequency_hz: Option<u64>,
+    pub runtime_state: Option<RuntimeState>,
 }
 
 #[derive(Clone, Debug)]
@@ -38,6 +57,14 @@ pub struct NpuMetrics {
     pub usage_percent: Option<f64>,
     pub per_core_usage_percent: Vec<f64>,
     pub frequency_hz: Option<u64>,
+    pub runtime_state: Option<RuntimeState>,
+}
+
+#[derive(Clone, Debug)]
+pub struct VpuMetrics {
+    pub usage_percent: Option<f64>,
+    pub frequency_hz: Option<u64>,
+    pub runtime_state: Option<RuntimeState>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

@@ -10,7 +10,7 @@ use anyhow::Result;
 
 pub use model::{
     CpuMetrics, DiskIoEntry, MachineInfo, MemoryMetrics, NetworkIoEntry, ProcessEntry,
-    SensorSummary, SystemSnapshot, UsageMetric,
+    RuntimeState, SensorSummary, SystemSnapshot, UsageMetric,
 };
 
 use model::{
