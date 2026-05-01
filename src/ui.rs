@@ -6,7 +6,8 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 
 use crate::app::App;
 use crate::metrics::{
-    CpuMetrics, DiskIoEntry, NetworkIoEntry, ProcessEntry, SensorSummary, SystemSnapshot,
+    CpuMetrics, DiskIoEntry, NetworkIoEntry, ProcessEntry, RuntimeState, SensorSummary,
+    SystemSnapshot,
 };
 
 struct ViewModel {
@@ -873,29 +874,60 @@ fn format_accelerator_summary(snapshot: &SystemSnapshot) -> Option<String> {
     let mut sections = Vec::new();
 
     if let Some(gpu) = snapshot.accelerators.gpu.as_ref() {
-        sections.push(format_gpu_summary(gpu.usage_percent, gpu.frequency_hz));
+        sections.push(format_gpu_summary(
+            gpu.usage_percent,
+            gpu.frequency_hz,
+            gpu.runtime_state,
+        ));
     }
     if let Some(npu) = snapshot.accelerators.npu.as_ref() {
         sections.push(format_npu_summary(
             npu.usage_percent,
             &npu.per_core_usage_percent,
             npu.frequency_hz,
+            npu.runtime_state,
+        ));
+    }
+    if let Some(vpu) = snapshot.accelerators.vpu.as_ref() {
+        sections.push(format_vpu_summary(
+            vpu.usage_percent,
+            vpu.frequency_hz,
+            vpu.runtime_state,
         ));
     }
 
     (!sections.is_empty()).then(|| sections.join("  "))
 }
 
-fn format_gpu_summary(usage_percent: Option<f64>, frequency_hz: Option<u64>) -> String {
-    format_accelerator_section("gpu", usage_percent, &[], frequency_hz)
+fn format_gpu_summary(
+    usage_percent: Option<f64>,
+    frequency_hz: Option<u64>,
+    runtime_state: Option<RuntimeState>,
+) -> String {
+    format_accelerator_section("gpu", usage_percent, &[], frequency_hz, runtime_state)
 }
 
 fn format_npu_summary(
     usage_percent: Option<f64>,
     per_core_usage_percent: &[f64],
     frequency_hz: Option<u64>,
+    runtime_state: Option<RuntimeState>,
 ) -> String {
-    format_accelerator_section("npu", usage_percent, per_core_usage_percent, frequency_hz)
+    format_accelerator_section(
+        "npu",
+        usage_percent,
+        per_core_usage_percent,
+        frequency_hz,
+        runtime_state,
+    )
+}
+
+fn format_vpu_summary(
+    usage_percent: Option<f64>,
+    frequency_hz: Option<u64>,
+    runtime_state: Option<RuntimeState>,
+) -> String {
+    format_accelerator_section("vpu", usage_percent, &[], frequency_hz, runtime_state)
 }
 
 fn format_accelerator_section(
@@ -903,6 +935,7 @@ fn format_accelerator_section(
     usage_percent: Option<f64>,
     per_core_usage_percent: &[f64],
     frequency_hz: Option<u64>,
+    runtime_state: Option<RuntimeState>,
 ) -> String {
     let mut parts = vec![label.to_string()];
 
@@ -915,6 +948,8 @@ fn format_accelerator_section(
         parts.push(format!("{core_text}%"));
     } else if let Some(usage_percent) = usage_percent {
         parts.push(format!("{usage_percent:.0}%"));
+    } else if let Some(runtime_state) = runtime_state {
+        parts.push(runtime_state.label().to_string());
     }
 
     if let Some(frequency_hz) = frequency_hz {
@@ -1097,12 +1132,34 @@ mod tests {
     #[test]
     fn formats_accelerator_sections_compactly() {
         assert_eq!(
-            format_gpu_summary(Some(7.0), Some(300_000_000)),
+            format_gpu_summary(Some(7.0), Some(300_000_000), None),
             "gpu 7% [300M]"
         );
         assert_eq!(
-            format_npu_summary(Some(4.0), &[12.0, 8.0, 0.0], Some(1_000_000_000)),
+            format_npu_summary(
+                Some(4.0),
+                &[12.0, 8.0, 0.0],
+                Some(1_000_000_000),
+                Some(RuntimeState::Active)
+            ),
             "npu 12/8/0% [1.0G]"
+        );
+        assert_eq!(
+            format_npu_summary(
+                None,
+                &[],
+                Some(1_200_000_000),
+                Some(RuntimeState::Suspended)
+            ),
+            "npu suspended [1.2G]"
+        );
+        assert_eq!(
+            format_vpu_summary(Some(38.0), Some(150_000_000), Some(RuntimeState::Active)),
+            "vpu 38% [150M]"
+        );
+        assert_eq!(
+            format_vpu_summary(None, Some(150_000_000), Some(RuntimeState::Suspended)),
+            "vpu suspended [150M]"
         );
     }
 
