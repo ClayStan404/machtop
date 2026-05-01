@@ -63,6 +63,17 @@ sudo dpkg -i machtop_<version>_<arch>.deb
 If your arm64 machine is on Debian 12 / Bookworm and the standard `arm64`
 package asks for a newer `libc6`, use the `arm64_bookworm` compatibility asset.
 
+### Arch Linux package
+
+Prebuilt `.pkg.tar.zst` packages are published for `x86_64`.
+
+Download the package from the
+[Releases](https://github.com/ClayStan404/machtop/releases) page and install it:
+
+```bash
+sudo pacman -U machtop-<version>-1-x86_64.pkg.tar.zst
+```
+
 ### Build from source
 
 Requirements:

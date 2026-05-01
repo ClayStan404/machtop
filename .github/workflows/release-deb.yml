@@ -191,11 +191,115 @@ jobs:
             ${{ steps.package.outputs.deb_path }}
             ${{ steps.package.outputs.sha_path }}
 
+  build-arch:
+    needs: resolve-release
+    runs-on: ubuntu-24.04
+    container:
+      image: archlinux:latest
+
+    steps:
+      - name: Install container dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm --needed base-devel rust pkgconf git sudo
+
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set version from release tag
+        env:
+          RELEASE_TAG: ${{ needs.resolve-release.outputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          sed -i "s/^version = \".*\"/version = \"${version}\"/" Cargo.toml
+          echo "Cargo.toml version set to ${version}"
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Build Arch package
+        id: package
+        env:
+          RELEASE_TAG: ${{ needs.resolve-release.outputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+
+          useradd -m builduser
+          echo "builduser ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+
+          cat > PKGBUILD << EOF
+          pkgname=machtop
+          pkgver=${version}
+          pkgrel=1
+          pkgdesc="A compact Linux TUI system monitor with CPU, thermal, GPU, and NPU metrics"
+          arch=('x86_64')
+          url="https://github.com/ClayStan404/machtop"
+          license=('GPL3')
+          depends=('gcc-libs')
+          source=()
+          sha256sums=()
+
+          package() {
+            install -Dm755 "\$startdir/target/release/machtop" "\$pkgdir/usr/bin/machtop"
+            install -Dm644 "\$startdir/README.md" "\$pkgdir/usr/share/doc/machtop/README.md"
+            install -Dm644 "\$startdir/LICENSE" "\$pkgdir/usr/share/doc/machtop/LICENSE"
+          }
+          EOF
+
+          chown -R builduser:builduser "$(pwd)"
+          sudo -u builduser makepkg --nodeps --skipinteg --noconfirm -f
+
+          pkg_path="$(find "$(pwd)" -maxdepth 1 -type f -name '*.pkg.tar.zst' | head -n 1)"
+          if [[ -z "${pkg_path}" ]]; then
+            echo "No .pkg.tar.zst package was produced" >&2
+            exit 1
+          fi
+          sha_path="${pkg_path}.sha256"
+          sha256sum "${pkg_path}" > "${sha_path}"
+          echo "pkg_path=${pkg_path}" >> "${GITHUB_OUTPUT}"
+          echo "sha_path=${sha_path}" >> "${GITHUB_OUTPUT}"
+
+      - name: Smoke test Arch package install
+        shell: bash
+        run: |
+          set -euo pipefail
+          pacman -U --noconfirm "${{ steps.package.outputs.pkg_path }}"
+          pacman -Ql machtop | grep -Fx '/usr/bin/machtop'
+          set +e
+          TERM=xterm timeout 2s script -qec "/usr/bin/machtop" /dev/null >/tmp/machtop-smoke.log 2>&1
+          status=$?
+          set -e
+          if [[ "${status}" -ne 0 && "${status}" -ne 124 ]]; then
+            cat /tmp/machtop-smoke.log >&2
+            exit "${status}"
+          fi
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: arch-package-x86_64
+          path: |
+            ${{ steps.package.outputs.pkg_path }}
+            ${{ steps.package.outputs.sha_path }}
+
   publish-release:
     needs:
       - resolve-release
       - build-deb
       - build-deb-arm64-bookworm
+      - build-arch
     runs-on: ubuntu-24.04
 
     steps:
@@ -203,7 +307,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: release-artifacts
-          pattern: deb-package-*
+          pattern: "*-package-*"
           merge-multiple: true
 
       - name: Publish release assets
@@ -213,6 +317,7 @@ jobs:
           target_commitish: ${{ github.sha }}
           files: |
             release-artifacts/*.deb
+            release-artifacts/*.pkg.tar.zst
             release-artifacts/*.sha256
           generate_release_notes: true
           fail_on_unmatched_files: true
