@@ -19,6 +19,7 @@ tempfile = "3.14"
 
 [package.metadata.deb]
 maintainer = "ClayStan404"
+maintainer-scripts = "debian/"
 copyright = "2026, ClayStan404"
 depends = "$auto"
 section = "utils"
