@@ -258,4 +258,35 @@ mod tests {
             Some(31.0)
         );
     }
+
+    #[test]
+    fn detects_rk3588_from_sensors_and_maps_big_cores() {
+        let machine = MachineInfo {
+            machine_name: "Generic Linux board".into(),
+            kernel: "6.0".into(),
+            arch: "aarch64".into(),
+        };
+        let sensors = vec![
+            SensorReading {
+                source: SensorSource::ThermalZone,
+                device_name: "thermal_zone0".into(),
+                label: "bigcore0-thermal".into(),
+                kind: SensorKind::Cpu,
+                temperature_c: 48.0,
+            },
+            SensorReading {
+                source: SensorSource::ThermalZone,
+                device_name: "thermal_zone1".into(),
+                label: "bigcore1-thermal".into(),
+                kind: SensorKind::Cpu,
+                temperature_c: 52.0,
+            },
+        ];
+
+        let profile = BoardProfile::detect(&machine, &sensors);
+
+        assert_eq!(profile, BoardProfile::RockchipRk3588);
+        assert_eq!(profile.per_cpu_temperature(4, &sensors), Some(48.0));
+        assert_eq!(profile.per_cpu_temperature(7, &sensors), Some(52.0));
+    }
 }

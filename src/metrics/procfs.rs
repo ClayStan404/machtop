@@ -17,9 +17,16 @@ pub struct ProcfsReader {
     page_size: u64,
 }
 
+#[derive(Debug)]
 pub struct CpuStatSnapshot {
     pub overall: CpuCounters,
-    pub per_cpu: Vec<CpuCounters>,
+    pub per_cpu: Vec<CpuStatEntry>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CpuStatEntry {
+    pub id: usize,
+    pub counters: CpuCounters,
 }
 
 pub struct RawMemoryInfo {
@@ -40,10 +47,6 @@ impl ProcfsReader {
             uid_map,
             page_size,
         }
-    }
-
-    pub fn page_size(&self) -> u64 {
-        self.page_size
     }
 
     pub fn read_cpu_stat(&self) -> Result<CpuStatSnapshot> {
@@ -91,20 +94,33 @@ impl ProcfsReader {
             .context("reading /proc/sys/kernel/osrelease")
     }
 
-    pub fn read_process_samples(&self, page_size: u64) -> Result<(Vec<RawProcessSample>, usize)> {
+    pub fn read_device_tree_model(&self) -> Option<String> {
+        read_trimmed(self.root.join("device-tree/model"))
+            .ok()
+            .map(|value| value.trim_end_matches('\0').to_string())
+            .filter(|value| !value.is_empty())
+    }
+
+    pub fn read_process_samples(&self) -> Result<(Vec<RawProcessSample>, usize)> {
         let entries = fs::read_dir(&self.root).context("reading /proc for process metrics")?;
         let mut process_list = Vec::new();
         let mut parse_errors = 0_usize;
 
         for entry in entries {
-            let entry = entry?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    parse_errors += 1;
+                    continue;
+                }
+            };
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if !name.chars().all(|ch| ch.is_ascii_digit()) {
                 continue;
             }
 
-            match read_process_sample(&entry.path(), &self.uid_map, page_size) {
+            match read_process_sample(&entry.path(), &self.uid_map, self.page_size) {
                 Ok(Some(sample)) => process_list.push(sample),
                 Ok(None) => {}
                 Err(_) => {
@@ -118,7 +134,8 @@ impl ProcfsReader {
 }
 
 pub fn parse_proc_stat(content: &str) -> Result<CpuStatSnapshot> {
-    let mut counters = Vec::new();
+    let mut overall = None;
+    let mut per_cpu = Vec::new();
 
     for line in content.lines() {
         if !line.starts_with("cpu") {
@@ -127,28 +144,43 @@ pub fn parse_proc_stat(content: &str) -> Result<CpuStatSnapshot> {
 
         let mut parts = line.split_whitespace();
         let name = parts.next().unwrap_or_default();
-        if name != "cpu" && !name[3..].chars().all(|c| c.is_ascii_digit()) {
-            continue;
-        }
+        let cpu_id = if name == "cpu" {
+            None
+        } else {
+            let Some(id) = name
+                .strip_prefix("cpu")
+                .filter(|id| !id.is_empty() && id.chars().all(|ch| ch.is_ascii_digit()))
+                .and_then(|id| id.parse::<usize>().ok())
+            else {
+                continue;
+            };
+            Some(id)
+        };
 
-        let values: Vec<u64> = parts.filter_map(|part| part.parse::<u64>().ok()).collect();
+        let values = parts
+            .map(|part| {
+                part.parse::<u64>()
+                    .with_context(|| format!("parsing counter {part:?} for {name}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
         if values.len() < 4 {
-            continue;
+            bail!("not enough counters for {name} in /proc/stat");
         }
 
-        let idle = values[3] + values.get(4).copied().unwrap_or(0);
+        let idle = values[3].saturating_add(values.get(4).copied().unwrap_or(0));
         let total = values.iter().sum();
-        counters.push(CpuCounters { idle, total });
+        let counters = CpuCounters { idle, total };
+        if let Some(id) = cpu_id {
+            per_cpu.push(CpuStatEntry { id, counters });
+        } else {
+            overall = Some(counters);
+        }
     }
 
-    if counters.is_empty() {
-        bail!("no cpu counters found in /proc/stat");
-    }
+    let overall = overall.context("overall cpu counters missing from /proc/stat")?;
+    per_cpu.sort_by_key(|cpu| cpu.id);
 
-    Ok(CpuStatSnapshot {
-        overall: counters[0],
-        per_cpu: counters.into_iter().skip(1).collect(),
-    })
+    Ok(CpuStatSnapshot { overall, per_cpu })
 }
 
 pub fn parse_load_average(content: &str) -> Result<LoadAverage> {
@@ -322,7 +354,7 @@ fn read_process_sample(
     };
     let status = match fs::read_to_string(process_path.join("status")) {
         Ok(content) => content,
-        Err(error) if is_missing_or_permission(&error) => return Ok(None),
+        Err(error) if is_missing_or_permission(&error) => String::new(),
         Err(error) => return Err(error).context("reading process status"),
     };
     let cmdline = match fs::read(process_path.join("cmdline")) {
@@ -330,9 +362,7 @@ fn read_process_sample(
         Err(error) if is_missing_or_permission(&error) => Vec::new(),
         Err(error) => return Err(error).context("reading process cmdline"),
     };
-    let comm = fs::read_to_string(process_path.join("comm")).unwrap_or_default();
-
-    parse_process_sample(pid, &stat, &status, &cmdline, &comm, uid_map, page_size)
+    parse_process_sample(pid, &stat, &status, &cmdline, "", uid_map, page_size)
 }
 
 pub fn parse_process_sample(
@@ -374,14 +404,18 @@ pub fn parse_process_sample(
             _ => return Ok(None),
         };
 
-    let uid = parse_status_uid(status).unwrap_or(0);
+    let uid = parse_status_uid(status);
     let command = parse_process_command(cmdline, comm_fallback)
-        .or(Some(comm))
+        .or_else(|| (!comm.is_empty()).then_some(comm))
         .unwrap_or_else(|| pid.to_string());
-    let user = uid_map
-        .get(&uid)
-        .cloned()
-        .unwrap_or_else(|| uid.to_string());
+    let user = uid
+        .map(|uid| {
+            uid_map
+                .get(&uid)
+                .cloned()
+                .unwrap_or_else(|| uid.to_string())
+        })
+        .unwrap_or_else(|| "?".to_string());
 
     Ok(Some(RawProcessSample {
         key: ProcessKey {
@@ -390,7 +424,7 @@ pub fn parse_process_sample(
         },
         user,
         state,
-        total_time_ticks: utime + stime,
+        total_time_ticks: utime.saturating_add(stime),
         rss_bytes: rss_pages.saturating_mul(page_size),
         command,
     }))
@@ -413,19 +447,29 @@ fn parse_process_command(cmdline: &[u8], comm_fallback: &str) -> Option<String> 
         let parts = cmdline
             .split(|byte| *byte == 0)
             .filter(|part| !part.is_empty())
-            .map(|part| String::from_utf8_lossy(part).to_string())
+            .map(|part| sanitize_process_text(&String::from_utf8_lossy(part)))
+            .filter(|part| !part.is_empty())
             .collect::<Vec<_>>();
         if !parts.is_empty() {
             return Some(parts.join(" "));
         }
     }
 
-    let trimmed = comm_fallback.trim();
+    let sanitized = sanitize_process_text(comm_fallback);
+    let trimmed = sanitized.trim();
     if trimmed.is_empty() {
         None
     } else {
         Some(trimmed.to_string())
     }
+}
+
+fn sanitize_process_text(text: &str) -> String {
+    let sanitized = text
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>();
+    sanitized.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn read_passwd_users() -> Result<HashMap<u32, String>> {
@@ -446,6 +490,7 @@ fn read_passwd_users() -> Result<HashMap<u32, String>> {
 }
 
 fn page_size() -> u64 {
+    // SAFETY: sysconf accepts _SC_PAGESIZE without additional pointer arguments.
     let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if size > 0 { size as u64 } else { 4096 }
 }
@@ -464,18 +509,29 @@ fn is_missing_or_permission(error: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::fs;
 
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn parses_proc_stat() {
         let snapshot = parse_proc_stat(
-            "cpu  10 0 10 80 0 0 0 0 0 0\ncpu0 5 0 5 40 0 0 0 0 0 0\ncpu1 5 0 5 40 0 0 0 0 0 0\n",
+            "cpu  10 0 10 80 0 0 0 0 0 0\ncpu0 5 0 5 40 0 0 0 0 0 0\ncpu2 5 0 5 40 0 0 0 0 0 0\n",
         )
         .unwrap();
 
         assert_eq!(snapshot.per_cpu.len(), 2);
+        assert_eq!(snapshot.per_cpu[0].id, 0);
+        assert_eq!(snapshot.per_cpu[1].id, 2);
         assert_eq!(snapshot.overall.total, 100);
+    }
+
+    #[test]
+    fn rejects_malformed_cpu_counters_without_shifting_fields() {
+        let error = parse_proc_stat("cpu 10 invalid 10 80\ncpu0 5 0 5 40\n").unwrap_err();
+
+        assert!(error.to_string().contains("parsing counter"));
     }
 
     #[test]
@@ -515,6 +571,43 @@ mod tests {
         assert_eq!(sample.user, "clay");
         assert_eq!(sample.command, "/usr/bin/worker --flag");
         assert_eq!(sample.rss_bytes, 5 * 4096);
+    }
+
+    #[test]
+    fn uses_unknown_user_and_sanitizes_process_commands() {
+        let sample = parse_process_sample(
+            42,
+            "42 (worker) R 1 1 1 1 1 0 0 0 0 0 10 5 0 0 20 0 1 0 99 1024 5 0 0 0 0 0 0 0 0 0 0 0",
+            "Name:\tworker\n",
+            b"/usr/bin/worker\0--line\nbreak\0",
+            "worker\n",
+            &HashMap::new(),
+            4096,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(sample.user, "?");
+        assert_eq!(sample.command, "/usr/bin/worker --line break");
+    }
+
+    #[test]
+    fn keeps_process_when_optional_metadata_disappears() {
+        let temp = tempdir().unwrap();
+        let process = temp.path().join("42");
+        fs::create_dir(&process).unwrap();
+        fs::write(
+            process.join("stat"),
+            "42 (worker) R 1 1 1 1 1 0 0 0 0 0 10 5 0 0 20 0 1 0 99 1024 5 0 0 0 0 0 0 0 0 0 0 0\n",
+        )
+        .unwrap();
+
+        let sample = read_process_sample(&process, &HashMap::new(), 4096)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(sample.user, "?");
+        assert_eq!(sample.command, "worker");
     }
 
     #[test]

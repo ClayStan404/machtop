@@ -2,6 +2,7 @@
 name = "machtop"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 description = "A compact Linux TUI system monitor with CPU, thermal, GPU, and NPU metrics"
 license = "GPL-3.0-or-later"
 readme = "README.md"
@@ -13,13 +14,14 @@ anyhow = "1.0"
 crossterm = "0.28"
 libc = "0.2"
 ratatui = "0.29"
+signal-hook = "0.3"
+unicode-width = "0.2"
 
 [dev-dependencies]
 tempfile = "3.14"
 
 [package.metadata.deb]
 maintainer = "ClayStan404"
-maintainer-scripts = "debian/"
 copyright = "2026, ClayStan404"
 depends = "$auto"
 section = "utils"

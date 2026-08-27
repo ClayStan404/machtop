@@ -15,50 +15,63 @@ use super::procfs::ProcfsReader;
 
 pub struct SysfsReader {
     root: PathBuf,
-    vpu_perf_monitor: VpuPerfMonitor,
+    devfreq_devices: Vec<DevfreqDevice>,
+    cix_platform: bool,
 }
 
-#[derive(Debug, Default)]
-struct VpuPerfMonitor {
-    initialized: bool,
-    enable_path: Option<PathBuf>,
-    restore_value: Option<String>,
-}
-
-impl Drop for SysfsReader {
-    fn drop(&mut self) {
-        self.restore_vpu_perf_monitor();
-    }
+#[derive(Clone, Debug)]
+struct DevfreqDevice {
+    path: PathBuf,
+    dir_name: String,
+    device_name: String,
 }
 
 impl SysfsReader {
     pub fn new(root: impl AsRef<Path>) -> Self {
+        let root = root.as_ref().to_path_buf();
+        let devfreq_devices = discover_devfreq_devices(&root);
+        let machine_name = read_dmi_system_name(&root)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let cix_platform = machine_name.contains("radxa orion o6")
+            || devfreq_devices.iter().any(|device| {
+                matches!(
+                    device.device_name.as_str(),
+                    "CIXH5000:00" | "CIXH4000:00" | "CIXH3010:00"
+                ) || matches!(
+                    device.dir_name.as_str(),
+                    "CIXH5000:00" | "CIXH4000:00" | "CIXH3010:00"
+                )
+            });
+
         Self {
-            root: root.as_ref().to_path_buf(),
-            vpu_perf_monitor: VpuPerfMonitor::default(),
+            root,
+            devfreq_devices,
+            cix_platform,
         }
     }
 
     pub fn machine_info(&self, procfs: &ProcfsReader) -> Result<MachineInfo> {
         let kernel = procfs.read_kernel_release()?;
+        let arch = uname_machine();
         let machine_name = self
-            .read_device_tree_model()
+            .read_device_tree_model(procfs)
             .or_else(|| self.read_dmi_system_name())
-            .unwrap_or_else(uname_machine);
+            .unwrap_or_else(|| arch.clone());
 
         Ok(MachineInfo {
             machine_name,
             kernel,
-            arch: uname_machine(),
+            arch,
         })
     }
 
     pub fn read_cpu_frequencies(
         &self,
-        cpu_count: usize,
+        cpu_ids: &[usize],
     ) -> std::collections::HashMap<usize, Option<u64>> {
-        let mut frequencies = std::collections::HashMap::with_capacity(cpu_count);
-        for cpu_id in 0..cpu_count {
+        let mut frequencies = std::collections::HashMap::with_capacity(cpu_ids.len());
+        for &cpu_id in cpu_ids {
             let base = self
                 .root
                 .join("devices/system/cpu")
@@ -71,7 +84,11 @@ impl SysfsReader {
         frequencies
     }
 
-    pub fn read_accelerators(&mut self) -> AcceleratorMetrics {
+    pub fn read_accelerators(&self) -> AcceleratorMetrics {
+        if self.is_cix_platform() {
+            return self.read_cix_accelerators();
+        }
+
         let gpu_usage = self
             .read_gpu_devfreq_usage()
             .or_else(|| self.read_gpu_debugfs_usage());
@@ -103,25 +120,25 @@ impl SysfsReader {
             None
         };
 
-        let generic = AcceleratorMetrics {
+        AcceleratorMetrics {
             gpu,
             npu,
             vpu: None,
-        };
-        let cix = self.read_cix_accelerators();
-
-        AcceleratorMetrics {
-            gpu: cix.gpu.or(generic.gpu),
-            npu: cix.npu.or(generic.npu),
-            vpu: cix.vpu,
         }
     }
 
-    pub fn read_sensors(&self) -> Result<Vec<SensorReading>> {
+    pub fn read_sensors(&self) -> (Vec<SensorReading>, Vec<String>) {
         let mut sensors = Vec::new();
-        sensors.extend(self.read_thermal_sensors()?);
-        sensors.extend(self.read_hwmon_sensors()?);
-        dedupe_sensors(sensors)
+        let mut warnings = Vec::new();
+        match self.read_thermal_sensors() {
+            Ok(readings) => sensors.extend(readings),
+            Err(error) => warnings.push(format!("thermal sensors unavailable: {error:#}")),
+        }
+        match self.read_hwmon_sensors() {
+            Ok(readings) => sensors.extend(readings),
+            Err(error) => warnings.push(format!("hwmon sensors unavailable: {error:#}")),
+        }
+        (dedupe_sensors(sensors), warnings)
     }
 
     fn read_thermal_sensors(&self) -> Result<Vec<SensorReading>> {
@@ -134,7 +151,9 @@ impl SysfsReader {
         let mut sensors = Vec::new();
 
         for entry in entries {
-            let entry = entry?;
+            let Ok(entry) = entry else {
+                continue;
+            };
             let name = entry.file_name().to_string_lossy().into_owned();
             if !name.starts_with("thermal_zone") {
                 continue;
@@ -148,8 +167,7 @@ impl SysfsReader {
                 .and_then(cix_acpi_thermal_label)
                 .unwrap_or(raw_label.as_str())
                 .to_string();
-            let raw_temp = read_u64(path.join("temp"))
-                .or_else(|_| read_i64(path.join("temp")).map(|value| value.max(0) as u64));
+            let raw_temp = read_i64(path.join("temp"));
             if let Ok(raw_temp) = raw_temp {
                 sensors.push(SensorReading {
                     source: SensorSource::ThermalZone,
@@ -175,7 +193,9 @@ impl SysfsReader {
         let mut sensors = Vec::new();
 
         for entry in entries {
-            let entry = entry?;
+            let Ok(entry) = entry else {
+                continue;
+            };
             let path = entry.path();
             if !path.is_dir() {
                 continue;
@@ -183,10 +203,14 @@ impl SysfsReader {
             let device_name = read_trimmed(path.join("name"))
                 .unwrap_or_else(|_| entry.file_name().to_string_lossy().into_owned());
 
-            for channel in
-                fs::read_dir(&path).with_context(|| format!("reading hwmon {device_name}"))?
-            {
-                let channel = channel?;
+            let channels = match fs::read_dir(&path) {
+                Ok(channels) => channels,
+                Err(_) => continue,
+            };
+            for channel in channels {
+                let Ok(channel) = channel else {
+                    continue;
+                };
                 let file_name = channel.file_name().to_string_lossy().into_owned();
                 if !file_name.starts_with("temp") || !file_name.ends_with("_input") {
                     continue;
@@ -194,7 +218,7 @@ impl SysfsReader {
 
                 let stem = file_name.trim_end_matches("_input");
                 let value = match read_i64(channel.path()) {
-                    Ok(value) => value.max(0) as u64,
+                    Ok(value) => value,
                     Err(_) => continue,
                 };
                 let label = read_trimmed(path.join(format!("{stem}_label")))
@@ -257,27 +281,15 @@ impl SysfsReader {
         parse_rknpu_debugfs_load(&content)
     }
 
-    fn find_devfreq_path(&self, matchers: &[&str]) -> Option<PathBuf> {
-        let base = self.root.join("class/devfreq");
-        let entries = fs::read_dir(&base).ok()?;
-        let mut candidates = Vec::new();
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-
-            let dir_name = entry.file_name().to_string_lossy().into_owned();
-            let device_name = read_trimmed(path.join("name")).unwrap_or_else(|_| dir_name.clone());
-            let haystack = format!("{dir_name} {device_name}").to_ascii_lowercase();
-            if matchers.iter().any(|matcher| haystack.contains(matcher)) {
-                candidates.push(path);
-            }
-        }
-
-        candidates.sort();
-        candidates.into_iter().next()
+    fn find_devfreq_path(&self, matchers: &[&str]) -> Option<&Path> {
+        self.devfreq_devices.iter().find_map(|device| {
+            let haystack =
+                format!("{} {}", device.dir_name, device.device_name).to_ascii_lowercase();
+            matchers
+                .iter()
+                .any(|matcher| haystack.contains(matcher))
+                .then_some(device.path.as_path())
+        })
     }
 
     fn read_named_devfreq_frequency_hz(&self, names: &[&str]) -> Option<u64> {
@@ -285,34 +297,16 @@ impl SysfsReader {
         read_u64(path.join("cur_freq")).ok()
     }
 
-    fn find_named_devfreq_path(&self, names: &[&str]) -> Option<PathBuf> {
-        let base = self.root.join("class/devfreq");
-        let entries = fs::read_dir(&base).ok()?;
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-
-            let dir_name = entry.file_name().to_string_lossy().into_owned();
-            let device_name = read_trimmed(path.join("name")).unwrap_or_else(|_| dir_name.clone());
-            if names
+    fn find_named_devfreq_path(&self, names: &[&str]) -> Option<&Path> {
+        self.devfreq_devices.iter().find_map(|device| {
+            names
                 .iter()
-                .any(|name| dir_name == *name || device_name == *name)
-            {
-                return Some(path);
-            }
-        }
-
-        None
+                .any(|name| device.dir_name == *name || device.device_name == *name)
+                .then_some(device.path.as_path())
+        })
     }
 
-    fn read_cix_accelerators(&mut self) -> AcceleratorMetrics {
-        if !self.is_cix_platform() {
-            return AcceleratorMetrics::default();
-        }
-
+    fn read_cix_accelerators(&self) -> AcceleratorMetrics {
         AcceleratorMetrics {
             gpu: self.read_cix_gpu_metrics(),
             npu: self.read_cix_npu_metrics(),
@@ -321,14 +315,7 @@ impl SysfsReader {
     }
 
     fn is_cix_platform(&self) -> bool {
-        let machine_name = self
-            .read_dmi_system_name()
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        machine_name.contains("radxa orion o6")
-            || self.find_named_devfreq_path(&["CIXH5000:00"]).is_some()
-            || self.find_named_devfreq_path(&["CIXH4000:00"]).is_some()
-            || self.find_named_devfreq_path(&["CIXH3010:00"]).is_some()
+        self.cix_platform
     }
 
     fn read_cix_gpu_metrics(&self) -> Option<GpuMetrics> {
@@ -359,9 +346,7 @@ impl SysfsReader {
         })
     }
 
-    fn read_cix_vpu_metrics(&mut self) -> Option<VpuMetrics> {
-        self.ensure_vpu_perf_monitor();
-
+    fn read_cix_vpu_metrics(&self) -> Option<VpuMetrics> {
         let usage_percent = self.read_vpu_debugfs_usage();
         let frequency_hz = self.read_named_devfreq_frequency_hz(&["CIXH3010:00"]);
         let runtime_state =
@@ -377,10 +362,11 @@ impl SysfsReader {
     }
 
     fn read_vpu_debugfs_usage(&self) -> Option<f64> {
-        let path = self
-            .root
-            .join("kernel/debug/amvx/log/group/perf/utilization");
-        parse_vpu_debugfs_utilization(&read_trimmed(path).ok()?)
+        let base = self.root.join("kernel/debug/amvx/log/group/perf");
+        if read_trimmed(base.join("enable")).is_ok_and(|value| value != "1") {
+            return None;
+        }
+        parse_vpu_debugfs_utilization(&read_trimmed(base.join("utilization")).ok()?)
     }
 
     fn read_runtime_state(&self, relative_path: &str) -> Option<RuntimeState> {
@@ -411,72 +397,65 @@ impl SysfsReader {
             .map(ToString::to_string)
     }
 
-    fn ensure_vpu_perf_monitor(&mut self) {
-        if self.vpu_perf_monitor.initialized {
-            return;
-        }
-        self.vpu_perf_monitor.initialized = true;
-
-        let enable_path = self.root.join("kernel/debug/amvx/log/group/perf/enable");
-        let current_value = match read_trimmed(&enable_path) {
-            Ok(value) => value,
-            Err(_) => return,
-        };
-
-        self.vpu_perf_monitor.enable_path = Some(enable_path.clone());
-        if current_value == "1" {
-            return;
-        }
-
-        if fs::write(&enable_path, "1\n").is_ok() {
-            self.vpu_perf_monitor.restore_value = Some(current_value);
-        }
-    }
-
-    fn restore_vpu_perf_monitor(&mut self) {
-        let Some(enable_path) = self.vpu_perf_monitor.enable_path.as_ref() else {
-            return;
-        };
-        let Some(restore_value) = self.vpu_perf_monitor.restore_value.as_ref() else {
-            return;
-        };
-
-        let _ = fs::write(enable_path, format!("{restore_value}\n"));
-        self.vpu_perf_monitor.restore_value = None;
-    }
-
-    fn read_device_tree_model(&self) -> Option<String> {
-        read_trimmed(Path::new("/proc/device-tree/model"))
-            .ok()
-            .map(|value| value.trim_end_matches('\0').to_string())
-            .filter(|value| !value.is_empty())
+    fn read_device_tree_model(&self, procfs: &ProcfsReader) -> Option<String> {
+        procfs.read_device_tree_model()
     }
 
     fn read_dmi_system_name(&self) -> Option<String> {
-        let vendor = read_trimmed(self.root.join("devices/virtual/dmi/id/sys_vendor")).ok();
-        let product = read_trimmed(self.root.join("devices/virtual/dmi/id/product_name")).ok();
-
-        match (vendor, product) {
-            (Some(vendor), Some(product)) if !vendor.is_empty() && !product.is_empty() => {
-                Some(format!("{vendor} {product}"))
-            }
-            (None, Some(product)) | (Some(product), None) if !product.is_empty() => Some(product),
-            _ => None,
-        }
+        read_dmi_system_name(&self.root)
     }
 }
 
-fn dedupe_sensors(mut sensors: Vec<SensorReading>) -> Result<Vec<SensorReading>> {
+fn discover_devfreq_devices(root: &Path) -> Vec<DevfreqDevice> {
+    let base = root.join("class/devfreq");
+    let mut devices = fs::read_dir(base)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.is_dir() {
+                return None;
+            }
+            let dir_name = entry.file_name().to_string_lossy().into_owned();
+            let device_name = read_trimmed(path.join("name")).unwrap_or_else(|_| dir_name.clone());
+            Some(DevfreqDevice {
+                path,
+                dir_name,
+                device_name,
+            })
+        })
+        .collect::<Vec<_>>();
+    devices.sort_by(|left, right| left.path.cmp(&right.path));
+    devices
+}
+
+fn read_dmi_system_name(root: &Path) -> Option<String> {
+    let vendor = read_trimmed(root.join("devices/virtual/dmi/id/sys_vendor")).ok();
+    let product = read_trimmed(root.join("devices/virtual/dmi/id/product_name")).ok();
+
+    match (vendor, product) {
+        (Some(vendor), Some(product)) if !vendor.is_empty() && !product.is_empty() => {
+            Some(format!("{vendor} {product}"))
+        }
+        (None, Some(product)) | (Some(product), None) if !product.is_empty() => Some(product),
+        _ => None,
+    }
+}
+
+fn dedupe_sensors(mut sensors: Vec<SensorReading>) -> Vec<SensorReading> {
     let mut seen = HashSet::new();
     sensors.retain(|sensor| {
         let key = (
+            sensor.source,
             sensor.kind,
+            sensor.device_name.to_ascii_lowercase(),
             sensor.label.to_ascii_lowercase(),
             (sensor.temperature_c * 1000.0).round() as i64,
         );
         seen.insert(key)
     });
-    Ok(sensors)
+    sensors
 }
 
 fn average_percent(values: &[f64]) -> Option<f64> {
@@ -547,6 +526,7 @@ fn parse_devfreq_load(content: &str) -> Option<f64> {
     (!prefix.is_empty())
         .then_some(prefix)
         .and_then(|value| value.parse::<f64>().ok())
+        .map(|value| value.clamp(0.0, 100.0))
 }
 
 fn parse_mali_debugfs_usage(content: &str) -> Option<f64> {
@@ -566,8 +546,10 @@ fn parse_mali_debugfs_usage(content: &str) -> Option<f64> {
 
     let busy_time = busy_time?;
     let idle_time = idle_time?;
-    let total_time = busy_time + idle_time;
-    (total_time > 0).then(|| (busy_time as f64 / total_time as f64) * 100.0)
+    let total_time = busy_time.saturating_add(idle_time);
+    (total_time > 0)
+        .then(|| (busy_time as f64 / total_time as f64) * 100.0)
+        .map(|value| value.clamp(0.0, 100.0))
 }
 
 fn parse_rknpu_debugfs_load(content: &str) -> Vec<f64> {
@@ -584,7 +566,7 @@ fn parse_rknpu_debugfs_load(content: &str) -> Vec<f64> {
             break;
         };
         if let Ok(value) = after_colon[..percent].trim().parse::<f64>() {
-            loads.push(value);
+            loads.push(value.clamp(0.0, 100.0));
         }
         remaining = &after_colon[percent + 1..];
     }
@@ -598,30 +580,33 @@ fn parse_vpu_debugfs_utilization(content: &str) -> Option<f64> {
         .strip_prefix("VPU Utilization:")?
         .trim()
         .trim_end_matches('%');
-    value.parse::<f64>().ok()
+    value
+        .parse::<f64>()
+        .ok()
+        .map(|value| value.clamp(0.0, 100.0))
 }
 
 fn parse_runtime_state(content: &str) -> Option<RuntimeState> {
     let state = content.trim().to_ascii_lowercase();
-    if state.is_empty() {
-        None
-    } else if state.contains("active") {
-        Some(RuntimeState::Active)
-    } else if state.contains("suspend") {
-        Some(RuntimeState::Suspended)
-    } else {
-        Some(RuntimeState::Unknown)
+    match state.as_str() {
+        "" => None,
+        "active" => Some(RuntimeState::Active),
+        "suspended" | "suspending" => Some(RuntimeState::Suspended),
+        _ => Some(RuntimeState::Unknown),
     }
 }
 
 fn uname_machine() -> String {
     let mut utsname = std::mem::MaybeUninit::<libc::utsname>::uninit();
+    // SAFETY: uname initializes the provided utsname on success.
     let rc = unsafe { libc::uname(utsname.as_mut_ptr()) };
     if rc != 0 {
         return std::env::consts::ARCH.to_string();
     }
 
+    // SAFETY: a successful uname call initialized utsname and its fields are NUL-terminated.
     let utsname = unsafe { utsname.assume_init() };
+    // SAFETY: utsname.machine is a NUL-terminated C character array after successful uname.
     let machine = unsafe { CStr::from_ptr(utsname.machine.as_ptr() as *const c_char) };
     machine.to_string_lossy().trim().to_string()
 }
@@ -722,7 +707,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut reader = SysfsReader::new(temp.path());
+        let reader = SysfsReader::new(temp.path());
         let accelerators = reader.read_accelerators();
 
         let gpu = accelerators.gpu.expect("gpu metrics");
@@ -737,7 +722,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_cix_accelerators_and_restores_vpu_perf_monitor() {
+    fn reads_cix_accelerators_without_changing_vpu_perf_monitor() {
         let temp = tempdir().unwrap();
         let gpu = temp.path().join("class/devfreq/CIXH5000:00");
         let npu = temp.path().join("class/devfreq/CIXH4000:00");
@@ -777,7 +762,7 @@ mod tests {
         fs::write(vpu_perf.join("utilization"), "VPU Utilization: 38.25%\n").unwrap();
 
         {
-            let mut reader = SysfsReader::new(temp.path());
+            let reader = SysfsReader::new(temp.path());
             let accelerators = reader.read_accelerators();
 
             let gpu = accelerators.gpu.expect("gpu metrics");
@@ -792,10 +777,10 @@ mod tests {
 
             let vpu = accelerators.vpu.expect("vpu metrics");
             assert_eq!(vpu.frequency_hz, Some(150_000_000));
-            assert_eq!(vpu.usage_percent, Some(38.25));
+            assert_eq!(vpu.usage_percent, None);
             assert_eq!(vpu.runtime_state, Some(RuntimeState::Active));
 
-            assert_eq!(fs::read_to_string(vpu_perf.join("enable")).unwrap(), "1\n");
+            assert_eq!(fs::read_to_string(vpu_perf.join("enable")).unwrap(), "0\n");
         }
 
         assert_eq!(fs::read_to_string(vpu_perf.join("enable")).unwrap(), "0\n");
@@ -805,7 +790,50 @@ mod tests {
     fn parses_devfreq_load_prefix() {
         assert_eq!(parse_devfreq_load("1@300000000Hz"), Some(1.0));
         assert_eq!(parse_devfreq_load("100@1000000000Hz"), Some(100.0));
+        assert_eq!(parse_devfreq_load("125@1000000000Hz"), Some(100.0));
         assert_eq!(parse_devfreq_load(""), None);
+    }
+
+    #[test]
+    fn preserves_negative_sensor_values() {
+        let temp = tempdir().unwrap();
+        let thermal = temp.path().join("class/thermal/thermal_zone0");
+        fs::create_dir_all(&thermal).unwrap();
+        fs::write(thermal.join("type"), "ambient\n").unwrap();
+        fs::write(thermal.join("temp"), "-5250\n").unwrap();
+
+        let reader = SysfsReader::new(temp.path());
+        let sensors = reader.read_thermal_sensors().unwrap();
+
+        assert_eq!(sensors[0].temperature_c, -5.25);
+    }
+
+    #[test]
+    fn keeps_available_sensor_source_when_another_source_fails() {
+        let temp = tempdir().unwrap();
+        let class = temp.path().join("class");
+        let hwmon = class.join("hwmon/hwmon0");
+        fs::create_dir_all(&hwmon).unwrap();
+        fs::write(class.join("thermal"), "not a directory\n").unwrap();
+        fs::write(hwmon.join("name"), "k10temp\n").unwrap();
+        fs::write(hwmon.join("temp1_input"), "38125\n").unwrap();
+
+        let reader = SysfsReader::new(temp.path());
+        let (sensors, warnings) = reader.read_sensors();
+
+        assert_eq!(sensors.len(), 1);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("thermal sensors unavailable"));
+    }
+
+    #[test]
+    fn parses_runtime_states_exactly() {
+        assert_eq!(parse_runtime_state("active"), Some(RuntimeState::Active));
+        assert_eq!(
+            parse_runtime_state("suspending"),
+            Some(RuntimeState::Suspended)
+        );
+        assert_eq!(parse_runtime_state("inactive"), Some(RuntimeState::Unknown));
     }
 
     #[test]

@@ -36,6 +36,7 @@ background service to install.
 - Dedicated overall CPU status row plus per-CPU usage bars with current frequency and optional per-CPU temperature
 - Summary panel with RAM, zram, and swap percentage meters
 - Summary panel with machine, accelerator, and sensor status
+- Load averages and collection warnings in the summary panel
 - Uptime and top processes
 - Real-time network RX/TX and disk read/write rates
 - Sensor collection from both `/sys/class/thermal` and `/sys/class/hwmon`
@@ -79,7 +80,7 @@ sudo pacman -U machtop-<version>-1-x86_64.pkg.tar.zst
 Requirements:
 
 - Linux
-- Rust toolchain
+- Rust 1.88 or newer
 - ANSI-capable terminal
 
 Run directly:
@@ -154,9 +155,14 @@ signals are treated as optional:
 
 - GPU utilization may fall back to driver-specific `debugfs` nodes
 - NPU utilization may come from driver-specific `debugfs` nodes
+- VPU utilization may come from a driver-specific performance monitor when it is already enabled
 
 If these files are not readable, `machtop` does not require `sudo` for the
 entire application. The unavailable values are simply omitted.
+
+`machtop` treats telemetry as read-only. In particular, it never enables a
+driver performance monitor through `debugfs`; frequency and runtime state can
+still be shown when utilization is unavailable.
 
 ### Notes on GPU and NPU telemetry
 
@@ -196,28 +202,30 @@ behavior.
 - `src/main.rs`: terminal lifecycle and event loop
 - `src/app.rs`: refresh timing and application state
 - `src/metrics/`: procfs/sysfs collection, derivation, and board profiles
-- `src/ui.rs`: layout, formatting, and theme logic
+- `src/ui.rs`: dashboard and panel layout
+- `src/ui/`: display formatting and theme helpers
 
 ## Development
 
 Useful commands:
 
 ```bash
-cargo fmt
-cargo test
-cargo clippy --all-targets -- -D warnings
+cargo fmt --check
+cargo test --locked
+cargo clippy --all-targets --locked -- -D warnings
 ```
 
 CI runs on both `amd64` and `arm64` and checks:
 
+- the Rust 1.88 minimum supported version
 - formatting
 - tests
 - clippy
 
 ## Releases
 
-The repository includes GitHub Actions workflows for both regular CI and Debian
-package releases.
+The repository includes GitHub Actions workflows for regular CI plus Debian and
+Arch Linux package releases.
 
 ### Create a tagged release
 
@@ -228,7 +236,7 @@ git push origin v0.1.0
 
 ### Trigger a release manually
 
-From the GitHub Actions page, run `Release Debian Package` and provide a
+From the GitHub Actions page, run `Release Packages` and provide a
 `release_tag`, for example:
 
 ```text

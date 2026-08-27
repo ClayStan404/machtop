@@ -7,6 +7,22 @@ on:
   pull_request:
 
 jobs:
+  msrv:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install minimum Rust toolchain
+        uses: dtolnay/rust-toolchain@1.88.0
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check minimum supported Rust version
+        run: cargo check --all-targets --locked
+
   lint-and-test:
     strategy:
       fail-fast: false

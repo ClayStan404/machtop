@@ -8,6 +8,8 @@ use std::time::Instant;
 
 use anyhow::Result;
 
+#[cfg(test)]
+pub(crate) use model::{AcceleratorMetrics, LoadAverage};
 pub use model::{
     CpuMetrics, DiskIoEntry, MachineInfo, MemoryMetrics, NetworkIoEntry, ProcessEntry,
     RuntimeState, SensorSummary, SystemSnapshot, UsageMetric,
@@ -26,7 +28,6 @@ pub struct MetricsSampler {
     sysfs: SysfsReader,
     machine: MachineInfo,
     previous: Option<RawSnapshot>,
-    last_process_parse_errors: usize,
 }
 
 impl MetricsSampler {
@@ -40,7 +41,6 @@ impl MetricsSampler {
             sysfs,
             machine,
             previous: None,
-            last_process_parse_errors: 0,
         })
     }
 
@@ -55,29 +55,52 @@ impl MetricsSampler {
 
     fn collect_raw_snapshot(&mut self) -> Result<RawSnapshot> {
         let captured_at = Instant::now();
+        let mut warnings = Vec::new();
         let cpu_stat = self.procfs.read_cpu_stat()?;
         let memory = self.procfs.read_memory_info()?;
-        let swaps = self.procfs.read_swaps()?;
+        let swaps = optional_or_default("swap metrics", self.procfs.read_swaps(), &mut warnings);
         let load_average = self.procfs.read_load_average()?;
         let uptime = self.procfs.read_uptime()?;
-        let frequencies = self.sysfs.read_cpu_frequencies(cpu_stat.per_cpu.len());
+        let cpu_ids = cpu_stat
+            .per_cpu
+            .iter()
+            .map(|cpu| cpu.id)
+            .collect::<Vec<_>>();
+        let frequencies = self.sysfs.read_cpu_frequencies(&cpu_ids);
         let cpus = cpu_stat
             .per_cpu
             .into_iter()
-            .enumerate()
-            .map(|(id, counters)| RawCpuSample {
-                id,
-                counters,
-                frequency_khz: frequencies.get(&id).copied().flatten(),
+            .map(|cpu| RawCpuSample {
+                id: cpu.id,
+                counters: cpu.counters,
+                frequency_khz: frequencies.get(&cpu.id).copied().flatten(),
             })
             .collect();
-        let network = self.procfs.read_network_samples()?;
-        let disks = self.procfs.read_disk_samples()?;
+        let network = optional_or_default(
+            "network metrics",
+            self.procfs.read_network_samples(),
+            &mut warnings,
+        );
+        let disks = optional_or_default(
+            "disk metrics",
+            self.procfs.read_disk_samples(),
+            &mut warnings,
+        );
         let accelerators = self.sysfs.read_accelerators();
-        let sensors = self.sysfs.read_sensors()?;
-        let (processes, process_parse_errors) =
-            self.procfs.read_process_samples(self.procfs.page_size())?;
-        self.last_process_parse_errors = process_parse_errors;
+        let (sensors, sensor_warnings) = self.sysfs.read_sensors();
+        warnings.extend(sensor_warnings);
+        let (processes, process_parse_errors) = match self.procfs.read_process_samples() {
+            Ok(samples) => samples,
+            Err(error) => {
+                warnings.push(format!("process metrics unavailable: {error:#}"));
+                (Vec::new(), 0)
+            }
+        };
+        if process_parse_errors > 0 {
+            warnings.push(format!(
+                "skipped {process_parse_errors} process entries while sampling"
+            ));
+        }
 
         Ok(RawSnapshot {
             captured_at,
@@ -96,7 +119,22 @@ impl MetricsSampler {
             swaps,
             accelerators,
             sensors,
+            warnings,
         })
+    }
+}
+
+fn optional_or_default<T: Default>(
+    label: &str,
+    result: Result<T>,
+    warnings: &mut Vec<String>,
+) -> T {
+    match result {
+        Ok(value) => value,
+        Err(error) => {
+            warnings.push(format!("{label} unavailable: {error:#}"));
+            T::default()
+        }
     }
 }
 
@@ -105,10 +143,16 @@ fn derive_snapshot(
     current: &RawSnapshot,
     profile: BoardProfile,
 ) -> SystemSnapshot {
-    let reset_cpu_deltas = previous
-        .map(|previous| previous.cpus.len() != current.cpus.len())
+    let cpu_topology_changed = previous
+        .map(|previous| {
+            previous
+                .cpus
+                .iter()
+                .map(|cpu| cpu.id)
+                .ne(current.cpus.iter().map(|cpu| cpu.id))
+        })
         .unwrap_or(true);
-    let previous_processes = if reset_cpu_deltas {
+    let previous_processes = if cpu_topology_changed {
         HashMap::new()
     } else {
         previous
@@ -121,7 +165,7 @@ fn derive_snapshot(
             })
             .unwrap_or_default()
     };
-    let total_cpu_delta = if reset_cpu_deltas {
+    let total_cpu_delta = if cpu_topology_changed {
         0
     } else {
         previous
@@ -142,7 +186,7 @@ fn derive_snapshot(
         })
         .unwrap_or(0.0);
 
-    let overall_usage_percent = if reset_cpu_deltas {
+    let overall_usage_percent = if cpu_topology_changed {
         0.0
     } else {
         previous
@@ -151,16 +195,24 @@ fn derive_snapshot(
     };
 
     let sensor_summary = profile.sensor_summary(&current.sensors);
+    let previous_cpus = previous
+        .map(|snapshot| {
+            snapshot
+                .cpus
+                .iter()
+                .map(|cpu| (cpu.id, cpu.counters))
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
     let cpus = current
         .cpus
         .iter()
-        .enumerate()
-        .map(|(index, cpu)| CpuMetrics {
+        .map(|cpu| CpuMetrics {
             id: cpu.id,
-            usage_percent: previous
-                .filter(|_| !reset_cpu_deltas)
-                .and_then(|snapshot| snapshot.cpus.get(index))
-                .map(|previous_cpu| usage_percent(previous_cpu.counters, cpu.counters))
+            usage_percent: (!cpu_topology_changed)
+                .then(|| previous_cpus.get(&cpu.id))
+                .flatten()
+                .map(|previous_counters| usage_percent(*previous_counters, cpu.counters))
                 .unwrap_or(0.0),
             frequency_khz: cpu.frequency_khz,
             temperature_c: profile.per_cpu_temperature(cpu.id, &current.sensors),
@@ -189,7 +241,7 @@ fn derive_snapshot(
         disk_io,
         sensor_summary,
         accelerators: current.accelerators.clone(),
-        sensors: current.sensors.clone(),
+        warnings: current.warnings.clone(),
     }
 }
 
@@ -441,6 +493,45 @@ mod tests {
         AcceleratorMetrics, LoadAverage, RawSwapSample, SensorKind, SensorReading, SensorSource,
     };
 
+    fn raw_snapshot_with_cpu(
+        id: usize,
+        idle: u64,
+        total: u64,
+        captured_at: Instant,
+    ) -> RawSnapshot {
+        RawSnapshot {
+            captured_at,
+            machine: MachineInfo {
+                machine_name: "Generic".into(),
+                kernel: "6.0".into(),
+                arch: "x86_64".into(),
+            },
+            uptime: Duration::from_secs(1),
+            load_average: LoadAverage {
+                one: 0.1,
+                five: 0.2,
+                fifteen: 0.3,
+            },
+            total_mem_bytes: 8 * 1024,
+            available_mem_bytes: 4 * 1024,
+            swap_total_bytes: 0,
+            swap_free_bytes: 0,
+            overall_cpu: CpuCounters { idle, total },
+            cpus: vec![RawCpuSample {
+                id,
+                counters: CpuCounters { idle, total },
+                frequency_khz: None,
+            }],
+            processes: Vec::new(),
+            network: Vec::new(),
+            disks: Vec::new(),
+            swaps: Vec::new(),
+            accelerators: AcceleratorMetrics::default(),
+            sensors: Vec::new(),
+            warnings: Vec::new(),
+        }
+    }
+
     #[test]
     fn derives_process_cpu_after_delta() {
         let machine = MachineInfo {
@@ -508,6 +599,7 @@ mod tests {
                 kind: SensorKind::Cpu,
                 temperature_c: 42.0,
             }],
+            warnings: Vec::new(),
         };
         let current = RawSnapshot {
             overall_cpu: CpuCounters {
@@ -595,6 +687,7 @@ mod tests {
             swaps: Vec::new(),
             accelerators: AcceleratorMetrics::default(),
             sensors: Vec::new(),
+            warnings: Vec::new(),
         };
         let current = RawSnapshot {
             overall_cpu: CpuCounters {
@@ -628,6 +721,25 @@ mod tests {
 
         assert_eq!(snapshot.overall_usage_percent, 0.0);
         assert!(snapshot.cpus.iter().all(|cpu| cpu.usage_percent == 0.0));
+    }
+
+    #[test]
+    fn resets_usage_when_cpu_ids_change_without_count_change() {
+        let start = Instant::now();
+        let previous = raw_snapshot_with_cpu(0, 50, 100, start);
+        let mut current = raw_snapshot_with_cpu(2, 60, 130, start + Duration::from_secs(1));
+        current.overall_cpu = CpuCounters {
+            idle: 120,
+            total: 260,
+        };
+        current.warnings = vec!["sensor degraded".into()];
+
+        let snapshot = derive_snapshot(Some(&previous), &current, BoardProfile::GenericLinux);
+
+        assert_eq!(snapshot.overall_usage_percent, 0.0);
+        assert_eq!(snapshot.cpus[0].id, 2);
+        assert_eq!(snapshot.cpus[0].usage_percent, 0.0);
+        assert_eq!(snapshot.warnings, vec!["sensor degraded"]);
     }
 
     #[test]
@@ -724,6 +836,7 @@ mod tests {
             ],
             accelerators: AcceleratorMetrics::default(),
             sensors: Vec::new(),
+            warnings: Vec::new(),
         };
         let current = RawSnapshot {
             captured_at: start + Duration::from_secs(1),

@@ -1,4 +1,4 @@
-name: Release Debian Package
+name: Release Packages
 
 on:
   push:
@@ -12,7 +12,7 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   resolve-release:
@@ -57,7 +57,12 @@ jobs:
         run: |
           set -euo pipefail
           version="${RELEASE_TAG#v}"
+          if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)*$ ]]; then
+            echo "Invalid SemVer release tag: ${RELEASE_TAG}" >&2
+            exit 1
+          fi
           sed -i "s/^version = \".*\"/version = \"${version}\"/" Cargo.toml
+          sed -i "/^name = \"machtop\"$/{n;s/^version = \".*\"/version = \"${version}\"/;}" Cargo.lock
           echo "Cargo.toml version set to ${version}"
 
       - name: Install Rust toolchain
@@ -70,7 +75,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y dpkg-dev
 
       - name: Install cargo-deb
-        run: cargo install cargo-deb --locked
+        run: cargo install cargo-deb --version 3.7.0 --locked
 
       - name: Run tests
         run: cargo test --locked
@@ -138,14 +143,19 @@ jobs:
         run: |
           set -euo pipefail
           version="${RELEASE_TAG#v}"
+          if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)*$ ]]; then
+            echo "Invalid SemVer release tag: ${RELEASE_TAG}" >&2
+            exit 1
+          fi
           sed -i "s/^version = \".*\"/version = \"${version}\"/" Cargo.toml
+          sed -i "/^name = \"machtop\"$/{n;s/^version = \".*\"/version = \"${version}\"/;}" Cargo.lock
           echo "Cargo.toml version set to ${version}"
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
 
       - name: Install cargo-deb
-        run: cargo install cargo-deb --locked
+        run: cargo install cargo-deb --version 3.7.0 --locked
 
       - name: Run tests
         run: cargo test --locked
@@ -215,7 +225,12 @@ jobs:
         run: |
           set -euo pipefail
           version="${RELEASE_TAG#v}"
+          if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)*$ ]]; then
+            echo "Invalid SemVer release tag: ${RELEASE_TAG}" >&2
+            exit 1
+          fi
           sed -i "s/^version = \".*\"/version = \"${version}\"/" Cargo.toml
+          sed -i "/^name = \"machtop\"$/{n;s/^version = \".*\"/version = \"${version}\"/;}" Cargo.lock
           echo "Cargo.toml version set to ${version}"
 
       - name: Cache Rust build artifacts
@@ -301,6 +316,8 @@ jobs:
       - build-deb-arm64-bookworm
       - build-arch
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
 
     steps:
       - name: Download packaged artifacts

@@ -4,6 +4,8 @@ mod ui;
 
 use std::io;
 use std::io::IsTerminal;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -15,6 +17,8 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+use signal_hook::flag;
 
 struct TerminalGuard {
     raw_mode: bool,
@@ -56,13 +60,17 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
 
+    let terminate = Arc::new(AtomicBool::new(false));
+    for signal in [SIGHUP, SIGINT, SIGTERM] {
+        flag::register(signal, Arc::clone(&terminate))?;
+    }
     let (guard, mut terminal) = TerminalGuard::enter()?;
     let mut app = App::new(Duration::from_secs(1))?;
 
-    loop {
+    while !terminate.load(Ordering::Relaxed) {
         terminal.draw(|frame| ui::render(frame, &app))?;
 
-        if event::poll(app.poll_timeout())?
+        if event::poll(app.poll_timeout().min(Duration::from_millis(200)))?
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
         {
@@ -79,7 +87,7 @@ fn main() -> Result<()> {
             }
         }
 
-        app.tick_if_needed()?;
+        app.tick_if_needed();
     }
 
     drop(guard);

@@ -87,7 +87,6 @@ pub enum SensorKind {
 
 #[derive(Clone, Debug)]
 pub struct SensorReading {
-    #[allow(dead_code)]
     pub source: SensorSource,
     pub device_name: String,
     pub label: String,
@@ -97,18 +96,14 @@ pub struct SensorReading {
 
 #[derive(Clone, Debug)]
 pub struct LoadAverage {
-    #[allow(dead_code)]
     pub one: f64,
-    #[allow(dead_code)]
     pub five: f64,
-    #[allow(dead_code)]
     pub fifteen: f64,
 }
 
 #[derive(Clone, Debug)]
 pub struct UsageMetric {
     pub total_bytes: u64,
-    #[allow(dead_code)]
     pub used_bytes: u64,
     pub used_percent: f64,
 }
@@ -120,6 +115,7 @@ impl UsageMetric {
     }
 
     pub fn from_total_and_used(total_bytes: u64, used_bytes: u64) -> Self {
+        let used_bytes = used_bytes.min(total_bytes);
         let used_percent = if total_bytes == 0 {
             0.0
         } else {
@@ -131,6 +127,19 @@ impl UsageMetric {
             used_bytes,
             used_percent,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_metrics_clamp_inconsistent_counters() {
+        let usage = UsageMetric::from_total_and_used(100, 120);
+
+        assert_eq!(usage.used_bytes, 100);
+        assert_eq!(usage.used_percent, 100.0);
     }
 }
 
@@ -171,7 +180,6 @@ pub struct DiskIoEntry {
 #[derive(Clone, Debug)]
 pub struct SystemSnapshot {
     pub machine: MachineInfo,
-    #[allow(dead_code)]
     pub load_average: LoadAverage,
     pub memory: MemoryMetrics,
     pub process_list: Vec<ProcessEntry>,
@@ -182,11 +190,10 @@ pub struct SystemSnapshot {
     pub disk_io: Vec<DiskIoEntry>,
     pub sensor_summary: Vec<SensorSummary>,
     pub accelerators: AcceleratorMetrics,
-    #[allow(dead_code)]
-    pub sensors: Vec<SensorReading>,
+    pub warnings: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CpuCounters {
     pub idle: u64,
     pub total: u64,
@@ -217,6 +224,7 @@ pub struct RawSnapshot {
     pub swaps: Vec<RawSwapSample>,
     pub accelerators: AcceleratorMetrics,
     pub sensors: Vec<SensorReading>,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
