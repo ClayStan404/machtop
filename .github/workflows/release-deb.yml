@@ -291,7 +291,8 @@ jobs:
         run: |
           set -euo pipefail
           pacman -U --noconfirm "${{ steps.package.outputs.pkg_path }}"
-          pacman -Ql machtop | grep -Fx '/usr/bin/machtop'
+          pacman -Qq machtop >/dev/null
+          test -x /usr/bin/machtop
           set +e
           TERM=xterm timeout 2s script -qec "/usr/bin/machtop" /dev/null >/tmp/machtop-smoke.log 2>&1
           status=$?
